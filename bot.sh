@@ -1169,14 +1169,14 @@ while true; do
 
     if [[ "$COUNT" -gt 0 ]]; then
         for (( i=0; i<COUNT; i++ )); do
-            UID=$(parse_update "$UPDATES" "$i" "uid")
+            UPD_ID=$(parse_update "$UPDATES" "$i" "uid")
             CID=$(parse_update "$UPDATES" "$i" "cid")
             TXT=$(parse_update "$UPDATES" "$i" "text")
 
-            if [[ -n "$UID" && -n "$CID" && -n "$TXT" ]]; then
+            if [[ -n "$UPD_ID" && -n "$CID" && -n "$TXT" ]]; then
                 echo "[$(date '+%H:%M:%S')] Chat ${CID}: ${TXT}"
                 handle "$CID" "$TXT"
-                save_offset $(( UID + 1 ))
+                save_offset $(( UPD_ID + 1 ))
             fi
         done
     fi
