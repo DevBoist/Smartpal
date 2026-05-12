@@ -1,0 +1,9 @@
+users/
+*.log
+*.csv
+.offset
+.quiz_pending
+.sys.tmp
+.usr.tmp
+.raw.tmp
+boosted.txt
