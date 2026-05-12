@@ -12,19 +12,19 @@
 #     Re-explain if confused
 #     MCQ Quiz on any topic (user picks 1-20 questions)
 #     Score + full explanation after every answer
-#     PDF Study — upload PDF → get MCQ, theory, summary, explanation
 #     Financial advisor (income, budget, spending alerts)
 #     Expense tracker
 #     Motivational quotes (/quote works)
 #     Trainable (/teach /correct)
-#     Usage limit (20 free AI actions/day, 3 PDFs/day)
+#     Usage limit (20 free AI actions/day)
 #     Admin tools (boost, reset, broadcast)
 #     Telegram command menu (sidebar)
 #     Security hardened (input sanitization)
 # ================================================================
 
-# NOTE: errexit/nounset/pipefail removed — they cause silent crashes
-# in a bot loop where some commands legitimately return non-zero.
+set -o errexit
+set -o nounset
+set -o pipefail
 
 # ──────────────────────────────────────────────────────────────
 # CONFIGURATION — supports env vars for Railway deployment
@@ -36,10 +36,6 @@ ADMIN_USERNAME="@Bazman"
 
 FREE_LIMIT=20
 BOOSTED_LIMIT=100
-PDF_FREE_LIMIT=3        # PDFs per day for free users
-PDF_BOOSTED_LIMIT=10    # PDFs per day for boosted users
-PDF_FREE_PAGES=50       # Max pages for free users
-PDF_BOOSTED_PAGES=100   # Max pages for boosted users
 
 GROQ_URL="https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL="llama-3.1-8b-instant"
@@ -59,7 +55,7 @@ LOG_FILE="$BOT_DIR/bot.log"
 
 mkdir -p "$USERS_DIR"
 touch "$KNOWLEDGE_FILE" "$LOG_FILE" 2>/dev/null
-# Expenses are now per-user — files created on first use in log_expense()
+[[ ! -f "$EXPENSES_FILE" ]] && echo "date,amount,category,note" > "$EXPENSES_FILE"
 
 # Quotes
 [[ ! -f "$QUOTES_FILE" ]] && cat > "$QUOTES_FILE" << 'ENDQUOTES'
@@ -117,52 +113,6 @@ send_msg() {
         -d chat_id="$cid" \
         --data-urlencode text="$txt" \
         -d parse_mode="Markdown" > /dev/null 2>&1 || true
-}
-
-# Send message with persistent bottom keyboard (like BONKbot style)
-send_keyboard() {
-    local cid="$1" txt="$2"
-    local keyboard='{"keyboard":[[{"text":"🧠 Quiz"},{"text":"📚 Explain"},{"text":"☀️ Quote"}],[{"text":"💰 Finance"},{"text":"📊 Summary"},{"text":"📋 Budget"}],[{"text":"💸 Log Expense"},{"text":"📈 Status"},{"text":"❓ Help"}]],"resize_keyboard":true,"persistent":true}'
-    RAW_TXT="$txt" RAW_KB="$keyboard" RAW_CID="$cid" RAW_URL="$TG_URL" python3 << 'PYEOF'
-import os, urllib.request, json
-cid = os.environ["RAW_CID"]
-txt = os.environ["RAW_TXT"]
-kb  = os.environ["RAW_KB"]
-url = os.environ["RAW_URL"] + "/sendMessage"
-data = json.dumps({"chat_id": cid, "text": txt, "parse_mode": "Markdown", "reply_markup": kb}).encode()
-req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-try: urllib.request.urlopen(req, timeout=10)
-except: pass
-PYEOF
-}
-
-# Send message with inline keyboard buttons
-send_buttons() {
-    local cid="$1" txt="$2" btns="$3"
-    local keyboard
-    keyboard=$(python3 << PYEOF
-import json, os
-rows_raw = ${btns}
-rows = []
-for row in rows_raw:
-    r = []
-    for label, cmd in zip(row[::2], row[1::2]):
-        r.append({"text": label, "callback_data": cmd})
-    rows.append(r)
-print(json.dumps({"inline_keyboard": rows}))
-PYEOF
-    )
-    RAW_TXT="$txt" RAW_KB="$keyboard" RAW_CID="$cid" RAW_URL="$TG_URL" python3 << 'PYEOF'
-import os, urllib.request, urllib.parse, json
-cid = os.environ["RAW_CID"]
-txt = os.environ["RAW_TXT"]
-kb  = os.environ["RAW_KB"]
-url = os.environ["RAW_URL"] + "/sendMessage"
-data = json.dumps({"chat_id": cid, "text": txt, "parse_mode": "Markdown", "reply_markup": kb}).encode()
-req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-try: urllib.request.urlopen(req, timeout=10)
-except: pass
-PYEOF
 }
 
 get_offset() { [[ -f "$OFFSET_FILE" ]] && cat "$OFFSET_FILE" || echo "0"; }
@@ -227,53 +177,46 @@ Contact ${ADMIN_USERNAME} for more access."
 ask_ai() {
     local system_msg="$1" user_msg="$2"
 
+    # Write to temp files — avoids all JSON escaping issues
     printf "%s" "$system_msg" > "$BOT_DIR/.sys.tmp"
     printf "%s" "$user_msg"   > "$BOT_DIR/.usr.tmp"
 
-    local raw
-    raw=$(SYS_FILE="$BOT_DIR/.sys.tmp" USR_FILE="$BOT_DIR/.usr.tmp" \
-          GEMINI_KEY="$GEMINI_API_KEY" GEMINI_ENDPOINT="$GEMINI_URL" python3 << 'PYEOF'
-import os, json, urllib.request, re
-
-sys_msg  = open(os.environ["SYS_FILE"]).read().strip()
-usr_msg  = open(os.environ["USR_FILE"]).read().strip()
-key      = os.environ["GEMINI_KEY"]
-endpoint = os.environ["GEMINI_ENDPOINT"]
-
-# Gemini payload — system instruction + user message
-payload = {
-    "system_instruction": {
-        "parts": [{"text": sys_msg}]
-    },
-    "contents": [
-        {"role": "user", "parts": [{"text": usr_msg}]}
+    local payload
+    payload=$(python3 - << 'PYEOF'
+import json, sys
+with open(sys.argv[1]) as f: sys_msg = f.read().strip()
+with open(sys.argv[2]) as f: usr_msg = f.read().strip()
+print(json.dumps({
+    "model": "llama-3.1-8b-instant",
+    "messages": [
+        {"role": "system", "content": sys_msg},
+        {"role": "user",   "content": usr_msg}
     ],
-    "generationConfig": {
-        "temperature": 0.75,
-        "maxOutputTokens": 1000
-    }
-}
-
-url = f"{endpoint}?key={key}"
-req = urllib.request.Request(
-    url,
-    data=json.dumps(payload).encode(),
-    headers={"Content-Type": "application/json"}
-)
-try:
-    with urllib.request.urlopen(req, timeout=30) as r:
-        d = json.loads(r.read())
-        t = d["candidates"][0]["content"]["parts"][0]["text"]
-        # Clean markdown symbols
-        t = re.sub(r"\*\*", "", t)
-        t = re.sub(r"^#+\s*", "", t, flags=re.M)
-        t = re.sub(r"^[-•]\s*", "", t, flags=re.M)
-        print(t.strip())
-except Exception as e:
-    print("")
+    "max_tokens": 700,
+    "temperature": 0.7
+}))
 PYEOF
-    )
-    echo "$raw"
+    "$BOT_DIR/.sys.tmp" "$BOT_DIR/.usr.tmp" 2>/dev/null)
+
+    [[ -z "$payload" ]] && echo "" && return
+
+    local raw
+    raw=$(curl -s -X POST "$GROQ_URL" \
+        -H "Authorization: Bearer ${GROQ_API_KEY}" \
+        -H "Content-Type: application/json" \
+        -d "$payload" 2>/dev/null)
+
+    python3 - << 'PYEOF'
+import sys, json, re
+try:
+    d = json.loads(sys.argv[1])
+    t = d["choices"][0]["message"]["content"]
+    t = re.sub(r'\*\*','',t); t = re.sub(r'#+\s*','',t)
+    t = re.sub(r'^[-•]\s*','',t,flags=re.M)
+    print(t.strip())
+except: print("")
+PYEOF
+    "$raw" 2>/dev/null
 }
 
 # ──────────────────────────────────────────────────────────────
@@ -281,15 +224,14 @@ PYEOF
 # ──────────────────────────────────────────────────────────────
 parse_update() {
     local json="$1" idx="$2" field="$3"
-    # FIX: Pass args via env vars — sys.argv does not work with heredoc
-    PU_JSON="$json" PU_IDX="$idx" PU_FIELD="$field" python3 << 'PYEOF'
-import os, json as j
+    python3 - << 'PYEOF'
+import sys, json
 try:
-    d = j.loads(os.environ["PU_JSON"])
+    d = json.loads(sys.argv[1])
     r = d.get("result", [])
-    i = int(os.environ["PU_IDX"])
-    f = os.environ["PU_FIELD"]
-    if i >= len(r): print(""); exit()
+    i = int(sys.argv[2])
+    f = sys.argv[3]
+    if i >= len(r): print(""); sys.exit()
     u = r[i]
     if   f == "uid":  print(u.get("update_id", ""))
     elif f == "cid":  print(u.get("message",{}).get("chat",{}).get("id",""))
@@ -297,6 +239,7 @@ try:
     else: print("")
 except: print("")
 PYEOF
+    "$json" "$idx" "$field" 2>/dev/null
 }
 
 # ──────────────────────────────────────────────────────────────
@@ -350,113 +293,27 @@ ai_chat() {
 
     send_msg "$cid" "🤔 _Thinking..._"
 
-    local name learned name_ctx extra
+    local name learned history name_ctx extra hist_ctx
     name=$(uget "$cid" "name")
     learned=$(tail -10 "$KNOWLEDGE_FILE" 2>/dev/null | sed 's/\[.*\] //' || echo "")
-    [[ -n "$name" ]]    && name_ctx="The user's name is ${name}. Use their name naturally sometimes but not every message." || name_ctx=""
-    [[ -n "$learned" ]] && extra="Things users have taught you (use if relevant): ${learned}" || extra=""
+    history=$(uget "$cid" "history")
+    [[ -n "$name" ]]    && name_ctx="The user's name is ${name}. Use their name naturally." || name_ctx=""
+    [[ -n "$learned" ]] && extra="Facts users taught you (use if relevant): ${learned}" || extra=""
+    [[ -n "$history" ]] && hist_ctx="Recent conversation: ${history}" || hist_ctx=""
 
-    # Check if web search needed
-    local web_ctx="" lower_q="${question,,}"
-    if [[ "$lower_q" == *"today"* || "$lower_q" == *"current"* || "$lower_q" == *"latest"* ||           "$lower_q" == *"news"* || "$lower_q" == *"price of"* || "$lower_q" == *"exchange rate"* ||           "$lower_q" == *"dollar"* || "$lower_q" == *"naira rate"* || "$lower_q" == *"who won"* ]]; then
-        web_ctx=$(web_search_context "$question")
-        [[ "$web_ctx" == "NO_RESULTS" ]] && web_ctx=""
-    fi
-
-    # Load persistent memory (survives restarts)
-    local memory
-    memory=$(load_memory "$cid")
-
-    local web_note=""
-    [[ -n "$web_ctx" ]] && web_note="
-
-[Current web info: ${web_ctx}]"
-
-    local sys="You are SmartPal — a brilliant, warm, and thoughtful AI assistant made for Nigerians. Your personality is like Claude from Anthropic: genuinely curious, deeply helpful, honest, and natural in conversation. You think carefully and give real answers.
-
-How you talk:
-- Like a very smart, warm friend — never robotic or stiff
-- Natural flowing sentences, not bullet points unless the topic calls for it
-- Honest when you are not sure about something
-- Use Nigerian context and examples naturally where it fits
-- Be concise for simple questions, go deep when needed
-- Show genuine interest — ask a follow-up question sometimes if it would help
-- Never start with Certainly, Of course, Sure, Great question, or Absolutely
-- No markdown symbols like ** or ## — plain text only
-- Use Naira symbol for money
-${name_ctx}
-${extra}${web_note}"
-
-    # Build messages with memory for true conversation context
-    local full_q="$question"
-    [[ -n "$web_ctx" ]] && full_q="${question}
-
-[Web search results: ${web_ctx}]"
+    local sys="You are SmartPal, a brilliant friendly AI assistant for Nigerians on Telegram. Answer any question on any topic. Be conversational and warm. Use plain text only — no markdown symbols. Keep answers under 220 words. Use Naira (N) for money. Be honest if you do not know something. ${name_ctx} ${extra} ${hist_ctx}"
 
     local answer
-    answer=$(MEMORY="$memory" SYS_MSG="$sys" USER_MSG="$full_q" \
-             GEMINI_KEY="$GEMINI_API_KEY" GEMINI_ENDPOINT="$GEMINI_URL" python3 << 'PYEOF'
-import os, json, urllib.request, re
-
-memory_raw = os.environ.get("MEMORY", "[]")
-sys_msg    = os.environ["SYS_MSG"]
-user_msg   = os.environ["USER_MSG"]
-key        = os.environ["GEMINI_KEY"]
-endpoint   = os.environ["GEMINI_ENDPOINT"]
-
-try:
-    history = json.loads(memory_raw)
-except:
-    history = []
-
-# Build Gemini contents array from history
-contents = []
-for msg in history[-16:]:
-    role = "user" if msg["role"] == "user" else "model"
-    contents.append({"role": role, "parts": [{"text": msg["content"]}]})
-contents.append({"role": "user", "parts": [{"text": user_msg}]})
-
-payload = {
-    "system_instruction": {"parts": [{"text": sys_msg}]},
-    "contents": contents,
-    "generationConfig": {"temperature": 0.75, "maxOutputTokens": 1000}
-}
-
-url = f"{endpoint}?key={key}"
-req = urllib.request.Request(
-    url,
-    data=json.dumps(payload).encode(),
-    headers={"Content-Type": "application/json"}
-)
-try:
-    with urllib.request.urlopen(req, timeout=30) as r:
-        d = json.loads(r.read())
-        t = d["candidates"][0]["content"]["parts"][0]["text"]
-        t = re.sub(r"\*\*", "", t)
-        t = re.sub(r"^#+\s*", "", t, flags=re.M)
-        t = re.sub(r"^[-•]\s*", "", t, flags=re.M)
-        print(t.strip())
-except Exception as e:
-    print("")
-PYEOF
-    )
-
+    answer=$(ask_ai "$sys" "$question")
     [[ -z "$answer" ]] && send_msg "$cid" "⚠️ Could not get answer right now. Please try again!" && return
 
     inc_usage "$cid"
-
-    # Save to persistent memory file (survives restarts)
-    save_memory "$cid" "user" "$question"
-    save_memory "$cid" "assistant" "$answer"
-
-    # Also save to old history for compatibility
-    local history; history=$(uget "$cid" "history")
+    # Save last 3 exchanges
     local hist="${history}
 User: ${question}
 Bot: ${answer}"
     uset "$cid" "history" "$(echo "$hist" | tail -6)"
-
-    send_msg "$cid" "${answer}
+    send_msg "$cid" "🤖 ${answer}
 
 $(usage_note "$cid")"
     log "CHAT $cid: ${question:0:40}"
@@ -577,14 +434,6 @@ Just type the number. Example: *5*"
 
 generate_question() {
     local cid="$1" topic="$2" qnum="$3" total="$4"
-    # FIX: retry counter as 5th arg — prevents infinite recursion
-    local attempt="${5:-0}"
-    if [[ "$attempt" -ge 3 ]]; then
-        send_msg "$cid" "⚠️ Could not generate a question after 3 tries. Please try /quiz ${topic} again."
-        quiz_clear "$cid"
-        rm -f "$QUIZ_FILE"
-        return
-    fi
     [[ "$(can_ai "$cid")" == "no" ]] && limit_msg "$cid" && return
 
     send_msg "$cid" "🧠 _Generating question ${qnum} of ${total}..._"
@@ -634,10 +483,9 @@ ${name_ctx}"
     od=$(echo "$resp" | grep "^D:"           | head -1 | sed 's/^D: *//')
 
     if [[ -z "$q" || -z "$a" || -z "$oa" || -z "$ob" ]]; then
-        # FIX: pass incremented attempt — no more infinite recursion
-        log "QUIZ_FAIL attempt=${attempt} resp_preview=$(echo "$resp" | head -1)"
-        sleep 2
-        generate_question "$cid" "$topic" "$qnum" "$total" $(( attempt + 1 ))
+        send_msg "$cid" "⚠️ Question generation failed. Trying again..."
+        sleep 1
+        generate_question "$cid" "$topic" "$qnum" "$total"
         return
     fi
 
@@ -780,14 +628,12 @@ Example: /spent 1500 food bought lunch"
         return
     fi
 
-    local uexp="$USERS_DIR/${cid}_expenses.csv"
-    [[ ! -f "$uexp" ]] && echo "date,amount,category,note" > "$uexp"
-    echo "$(date '+%Y-%m-%d'),${amt},${cat},${note}" >> "$uexp"
+    echo "$(date '+%Y-%m-%d'),${amt},${cat},${note}" >> "$EXPENSES_FILE"
 
     local income spent rem pct
     income=$(uget "$cid" "income"); [[ -z "$income" ]] && income=0
     spent=$(awk -F',' -v m="$(date '+%Y-%m')" \
-        'NR>1 && substr($1,1,7)==m {s+=$2} END {printf "%.0f",s+0}' "$uexp")
+        'NR>1 && substr($1,1,7)==m {s+=$2} END {printf "%.0f",s+0}' "$EXPENSES_FILE")
     rem=$(( income - spent ))
     [[ "$income" -gt 0 ]] && pct=$(( spent * 100 / income )) || pct=0
 
@@ -815,17 +661,15 @@ ${warn}
 show_summary() {
     local cid="$1"
     local income spent rem pct count cats
-    local uexp="$USERS_DIR/${cid}_expenses.csv"
-    [[ ! -f "$uexp" ]] && echo "date,amount,category,note" > "$uexp"
 
     income=$(uget "$cid" "income"); [[ -z "$income" ]] && income=0
     spent=$(awk -F',' -v m="$(date '+%Y-%m')" \
-        'NR>1 && substr($1,1,7)==m {s+=$2} END {printf "%.0f",s+0}' "$uexp")
+        'NR>1 && substr($1,1,7)==m {s+=$2} END {printf "%.0f",s+0}' "$EXPENSES_FILE")
     count=$(awk -F',' -v m="$(date '+%Y-%m')" \
-        'NR>1 && substr($1,1,7)==m {c++} END {print c+0}' "$uexp")
+        'NR>1 && substr($1,1,7)==m {c++} END {print c+0}' "$EXPENSES_FILE")
     cats=$(awk -F',' -v m="$(date '+%Y-%m')" \
         'NR>1 && substr($1,1,7)==m {cat[$3]+=$2} END {for(c in cat) printf "  %s: N%.0f\n",c,cat[c]}' \
-        "$uexp")
+        "$EXPENSES_FILE")
     rem=$(( income - spent ))
     [[ "$income" -gt 0 ]] && pct=$(( spent * 100 / income )) || pct=0
 
@@ -908,10 +752,8 @@ finance_advice() {
 
     local income spent rem
     income=$(uget "$cid" "income"); [[ -z "$income" ]] && income=0
-    local uexp="$USERS_DIR/${cid}_expenses.csv"
-    [[ ! -f "$uexp" ]] && echo "date,amount,category,note" > "$uexp"
     spent=$(awk -F',' -v m="$(date '+%Y-%m')" \
-        'NR>1 && substr($1,1,7)==m {s+=$2} END {printf "%.0f",s+0}' "$uexp")
+        'NR>1 && substr($1,1,7)==m {s+=$2} END {printf "%.0f",s+0}' "$EXPENSES_FILE")
     rem=$(( income - spent ))
     local name; name=$(uget "$cid" "name")
     local name_ctx=""
@@ -951,291 +793,6 @@ bot_correct() {
 _\"${c}\"_
 
 Thank you for helping me improve! 🙏"
-}
-
-# ──────────────────────────────────────────────────────────────
-# PDF STUDY FEATURE
-# ──────────────────────────────────────────────────────────────
-
-# Get how many PDFs user has processed today
-get_pdf_usage() {
-    local cid="$1" f="$USERS_DIR/${cid}_pdf_usage"
-    [[ ! -f "$f" ]] && echo "0" && return
-    local d c
-    d=$(cut -d'|' -f1 "$f")
-    c=$(cut -d'|' -f2 "$f")
-    [[ "$d" == "$(date '+%Y-%m-%d')" ]] && echo "$c" || echo "0"
-}
-
-inc_pdf_usage() {
-    local cid="$1" cur
-    cur=$(get_pdf_usage "$cid")
-    echo "$(date '+%Y-%m-%d')|$(( cur + 1 ))" > "$USERS_DIR/${cid}_pdf_usage"
-}
-
-can_pdf() {
-    local cid="$1"
-    local used limit
-    used=$(get_pdf_usage "$cid")
-    if [[ "$(uget "$cid" "boosted")" == "yes" ]]; then
-        limit=$PDF_BOOSTED_LIMIT
-    else
-        limit=$PDF_FREE_LIMIT
-    fi
-    [[ "$used" -lt "$limit" ]] && echo "yes" || echo "no"
-}
-
-get_pdf_page_limit() {
-    local cid="$1"
-    if [[ "$(uget "$cid" "boosted")" == "yes" ]]; then
-        echo "$PDF_BOOSTED_PAGES"
-    else
-        echo "$PDF_FREE_PAGES"
-    fi
-}
-
-# Download and process a PDF sent by the user
-handle_pdf() {
-    local cid="$1" file_id="$2" file_name="$3"
-
-    # Check PDF usage limit
-    if [[ "$(can_pdf "$cid")" == "no" ]]; then
-        local used limit
-        used=$(get_pdf_usage "$cid")
-        if [[ "$(uget "$cid" "boosted")" == "yes" ]]; then
-            limit=$PDF_BOOSTED_LIMIT
-        else
-            limit=$PDF_FREE_LIMIT
-        fi
-        send_msg "$cid" "📵 You have used all *${limit} PDF uploads* for today.
-
-Your limit resets at midnight. Contact @Bazman to get boosted access for more uploads! 🚀"
-        return
-    fi
-
-    send_msg "$cid" "📄 Got your PDF! Downloading and reading it...
-
-⏳ This may take a moment depending on the file size."
-
-    # Get file path from Telegram
-    local file_info file_path
-    file_info=$(curl -s "${TG_URL}/getFile?file_id=${file_id}" 2>/dev/null)
-    file_path=$(echo "$file_info" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('result',{}).get('file_path',''))" 2>/dev/null)
-
-    if [[ -z "$file_path" ]]; then
-        send_msg "$cid" "❌ Could not download the PDF. Please try again."
-        return
-    fi
-
-    # Download PDF to temp location
-    local pdf_tmp="$BOT_DIR/.pdf_${cid}.pdf"
-    curl -s "https://api.telegram.org/file/bot${BOT_TOKEN}/${file_path}" -o "$pdf_tmp" 2>/dev/null
-
-    if [[ ! -f "$pdf_tmp" ]]; then
-        send_msg "$cid" "❌ Download failed. Please try again."
-        return
-    fi
-
-    # Install pdfplumber if not available
-    python3 -c "import pdfplumber" 2>/dev/null || pip3 install pdfplumber --break-system-packages -q 2>/dev/null
-
-    # Extract text and page count
-    local page_limit
-    page_limit=$(get_pdf_page_limit "$cid")
-
-    local extracted
-    extracted=$(PDF_FILE="$pdf_tmp" PAGE_LIMIT="$page_limit" python3 << 'PYEOF'
-import os, sys
-pdf_file = os.environ["PDF_FILE"]
-page_limit = int(os.environ["PAGE_LIMIT"])
-try:
-    import pdfplumber
-    with pdfplumber.open(pdf_file) as pdf:
-        total = len(pdf.pages)
-        pages_to_read = min(total, page_limit)
-        text = ""
-        for i in range(pages_to_read):
-            page_text = pdf.pages[i].extract_text()
-            if page_text:
-                text += f"
---- Page {i+1} ---
-{page_text}"
-        print(f"PAGES:{total}:{pages_to_read}")
-        print(text[:15000])  # Cap at 15000 chars to avoid huge outputs
-except Exception as e:
-    print(f"ERROR:{e}")
-PYEOF
-    )
-
-    rm -f "$pdf_tmp"
-
-    if [[ "$extracted" == ERROR:* ]]; then
-        send_msg "$cid" "❌ Could not read this PDF. Make sure it is a text-based PDF (not a scanned image).
-
-Tip: PDFs from downloads, handouts typed on a computer work best. Scanned/photo PDFs don't work."
-        return
-    fi
-
-    # Parse page info
-    local total_pages pages_read
-    total_pages=$(echo "$extracted" | head -1 | cut -d':' -f2)
-    pages_read=$(echo "$extracted" | head -1 | cut -d':' -f3)
-    local pdf_text
-    pdf_text=$(echo "$extracted" | tail -n +2)
-
-    if [[ -z "$pdf_text" || ${#pdf_text} -lt 50 ]]; then
-        send_msg "$cid" "❌ This PDF appears to be a scanned image — I can only read text-based PDFs.
-
-Tip: Try a PDF that was typed/created digitally, not one that was scanned."
-        return
-    fi
-
-    # Increment PDF usage
-    inc_pdf_usage "$cid"
-    local pdf_used pdf_left
-    pdf_used=$(get_pdf_usage "$cid")
-    if [[ "$(uget "$cid" "boosted")" == "yes" ]]; then
-        pdf_left=$(( PDF_BOOSTED_LIMIT - pdf_used ))
-    else
-        pdf_left=$(( PDF_FREE_LIMIT - pdf_used ))
-    fi
-
-    # Store PDF text for this user (for follow-up questions)
-    printf "%s" "$pdf_text" > "$USERS_DIR/${cid}_pdf_context.txt"
-    uset "$cid" "pdf_name" "$file_name"
-
-    send_msg "$cid" "✅ PDF read successfully!
-
-📄 *${file_name}*
-📃 Total pages: *${total_pages}*
-📖 Pages read: *${pages_read}*
-📊 PDF uploads left today: *${pdf_left}*
-
-What do you want me to do with this material?"
-
-    # Show options as keyboard
-    RAW_TXT="Choose an option:" RAW_KB="{"inline_keyboard":[[{"text":"🧠 Set MCQ Questions","callback_data":"_pdf_mcq"},{"text":"📝 Set Theory Questions","callback_data":"_pdf_theory"}],[{"text":"📚 Explain Simply","callback_data":"_pdf_explain"},{"text":"📋 Summarize","callback_data":"_pdf_summary"}]]}" RAW_CID="$cid" RAW_URL="$TG_URL" python3 << 'PYEOF'
-import os, urllib.request, json
-cid = os.environ["RAW_CID"]
-txt = os.environ["RAW_TXT"]
-kb  = os.environ["RAW_KB"]
-url = os.environ["RAW_URL"] + "/sendMessage"
-data = json.dumps({"chat_id": cid, "text": txt, "parse_mode": "Markdown", "reply_markup": kb}).encode()
-req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-try: urllib.request.urlopen(req, timeout=10)
-except: pass
-PYEOF
-}
-
-# Process PDF with AI based on user's chosen action
-process_pdf_action() {
-    local cid="$1" action="$2"
-
-    local ctx_file="$USERS_DIR/${cid}_pdf_context.txt"
-    if [[ ! -f "$ctx_file" ]]; then
-        send_msg "$cid" "❌ No PDF in memory. Please send a PDF first."
-        return
-    fi
-
-    local pdf_text pdf_name
-    pdf_text=$(cat "$ctx_file")
-    pdf_name=$(uget "$cid" "pdf_name")
-
-    [[ "$(can_ai "$cid")" == "no" ]] && limit_msg "$cid" && return
-
-    local instruction system_prompt
-    case "$action" in
-        mcq)
-            send_msg "$cid" "🧠 Generating MCQ questions from *${pdf_name}*...
-
-⏳ Processing the material, please wait."
-            system_prompt="You are a professional exam setter. Read the provided study material and generate 10 multiple choice questions based on it. Use EXACTLY this format for each question:
-
-QUESTION: the question here
-A: option one
-B: option two
-C: option three
-D: option four
-ANSWER: correct letter
-EXPLANATION: brief explanation
-
-Number each question 1-10. Only use information from the provided material."
-            instruction="Generate 10 MCQ questions from this study material:
-
-${pdf_text}"
-            ;;
-        theory)
-            send_msg "$cid" "📝 Generating theory questions from *${pdf_name}*...
-
-⏳ Processing the material, please wait."
-            system_prompt="You are a professional exam setter. Read the provided study material and generate 8 theory/essay questions based on it. For each question also provide a model answer outline. Use this format:
-
-Q1: [question]
-Model Answer: [key points to cover]
-
-Make questions that test deep understanding, not just recall."
-            instruction="Generate 8 theory questions with model answers from this study material:
-
-${pdf_text}"
-            ;;
-        explain)
-            send_msg "$cid" "📚 Explaining *${pdf_name}* simply...
-
-⏳ Breaking it down for you, please wait."
-            system_prompt="You are a brilliant teacher. Read the provided study material and explain it in the simplest possible way. Use Nigerian everyday examples where possible. Structure your explanation as:
-
-OVERVIEW: what this material is about in 2 sentences
-KEY POINTS: the 5-7 most important things to know
-SIMPLE EXPLANATION: explain the main concepts like you are talking to a secondary school student
-REMEMBER THIS: the 3 most important things to remember for exams"
-            instruction="Explain this study material simply:
-
-${pdf_text}"
-            ;;
-        summary)
-            send_msg "$cid" "📋 Summarizing *${pdf_name}*...
-
-⏳ Creating your summary, please wait."
-            system_prompt="You are an expert study assistant. Read the provided material and create a clear, concise study summary. Structure it as:
-
-TOPIC: main topic
-KEY CONCEPTS: bullet points of main ideas
-IMPORTANT DETAILS: facts, dates, figures worth remembering
-EXAM TIPS: what to focus on for exams
-SUMMARY: 3-5 sentence overall summary"
-            instruction="Summarize this study material:
-
-${pdf_text}"
-            ;;
-    esac
-
-    local response
-    response=$(ask_ai "$system_prompt" "$instruction")
-    inc_usage "$cid"
-
-    if [[ -z "$response" ]]; then
-        send_msg "$cid" "❌ AI could not process this material. Please try again."
-        return
-    fi
-
-    # Split long responses (Telegram has 4096 char limit per message)
-    if [[ ${#response} -gt 3800 ]]; then
-        local part1 part2
-        part1="${response:0:3800}"
-        part2="${response:3800}"
-        send_msg "$cid" "$part1"
-        sleep 1
-        send_msg "$cid" "$part2"
-    else
-        send_msg "$cid" "$response"
-    fi
-
-    send_msg "$cid" "
-
-Want to do something else with this PDF?
-- Send another PDF to upload a new one
-- /quiz TOPIC for a regular quiz
-- Type any question about the material and I will answer it"
 }
 
 # ──────────────────────────────────────────────────────────────
@@ -1379,10 +936,10 @@ handle() {
         /start)
             local name; name=$(uget "$cid" "name")
             if [[ -n "$name" ]]; then
-                send_keyboard "$cid" "👋 Welcome back *${name}!*
+                send_msg "$cid" "👋 Welcome back *${name}!*
 
-Good to see you again — pick what you need below or just type anything 😊"
-
+Good to see you again! What can I help you with?
+Type /help to see all I can do 😊"
             else
                 uflag_set "$cid" "need_name"
                 send_msg "$cid" "👋 *Hello! I am SmartPal!*
@@ -1400,21 +957,13 @@ Before we start — *what is your name?* 😊"
         /summary)   show_summary "$cid" ;;
         /newchat)
             uset "$cid" "history" ""
-            clear_memory "$cid"
-            send_msg "$cid" "🗑️ Conversation cleared! Fresh start 😊 I've forgotten everything — what would you like to talk about?"
+            send_msg "$cid" "🗑️ Conversation history cleared! Fresh start 😊"
             ;;
         /clear)
-            local uexp="$USERS_DIR/${cid}_expenses.csv"
-            echo "date,amount,category,note" > "$uexp"
+            echo "date,amount,category,note" > "$EXPENSES_FILE"
             send_msg "$cid" "🗑️ Expenses cleared! Starting fresh ✅"
             ;;
         /hint)      quiz_hint "$cid" ;;
-
-        # PDF action buttons
-        _pdf_mcq)     process_pdf_action "$cid" "mcq" ;;
-        _pdf_theory)  process_pdf_action "$cid" "theory" ;;
-        _pdf_explain) process_pdf_action "$cid" "explain" ;;
-        _pdf_summary) process_pdf_action "$cid" "summary" ;;
         /skip)
             rm -f "$QUIZ_FILE"
             quiz_clear "$cid"
@@ -1454,36 +1003,6 @@ Example: *50000*"
             ;;
         /teach\ *)   bot_learn "$cid" "$text" ;;
         /correct\ *) bot_correct "$cid" "$text" ;;
-
-        # Button tap handlers (inline)
-        _btn_quiz)    send_msg "$cid" "🧠 What topic do you want to quiz on?
-Type: /quiz TOPIC
-Example: /quiz biology" ;;
-        _btn_explain) send_msg "$cid" "📚 What topic do you want explained?
-Type: /explain TOPIC
-Example: /explain photosynthesis" ;;
-        _btn_finance) finance_advice "$cid" "give me financial advice" ;;
-        _btn_quote)   send_quote "$cid" ;;
-        _btn_summary) show_summary "$cid" ;;
-        _btn_help)    show_help "$cid" ;;
-
-        # Persistent keyboard button text handlers
-        "🧠 Quiz")      send_msg "$cid" "🧠 What topic do you want to quiz on?
-Type: /quiz TOPIC
-Example: /quiz biology" ;;
-        "📚 Explain")   send_msg "$cid" "📚 What topic do you want explained?
-Type: /explain TOPIC
-Example: /explain photosynthesis" ;;
-        "☀️ Quote")    send_quote "$cid" ;;
-        "💰 Finance")   finance_advice "$cid" "give me financial advice" ;;
-        "📊 Summary")   show_summary "$cid" ;;
-        "📋 Budget")    show_budget "$cid" ;;
-        "💸 Log Expense") send_msg "$cid" "💸 To log an expense use:
-/spent AMOUNT CATEGORY note
-
-Example: /spent 1500 food bought lunch" ;;
-        "📈 Status")    show_status "$cid" ;;
-        "❓ Help")      show_help "$cid" ;;
 
         /boost\ * | /unboost\ * | /resetlimit\ * | /users | /broadcast\ *)
             admin_cmd "$cid" "$text"
@@ -1529,7 +1048,8 @@ Example: *5*"
             if [[ "$(uflag_check "$cid" "need_name")" == "yes" ]]; then
                 uflag_clear "$cid" "need_name"
                 uset "$cid" "name" "$text"
-                send_keyboard "$cid" "Nice to meet you *${text}!* 🎉
+                uflag_set "$cid" "need_income"
+                send_msg "$cid" "Nice to meet you *${text}!* 🎉
 
 I am SmartPal — your personal AI assistant for:
   🤖 Answering any question
@@ -1538,7 +1058,13 @@ I am SmartPal — your personal AI assistant for:
   💰 Tracking your money and giving financial advice
   ☀️ Daily motivation
 
-You are all set! Use the buttons below or just type anything 😊"
+One more thing to set up your financial advisor:
+
+💰 *What is your monthly income or allowance?*
+
+Type the amount in Naira. Example: *50000*
+
+This helps me give you smart budget advice and spending alerts!"
                 return
             fi
 
@@ -1622,22 +1148,11 @@ fi
 # ──────────────────────────────────────────────────────────────
 # STARTUP
 # ──────────────────────────────────────────────────────────────
-# Validate required environment variables
-if [[ -z "$BOT_TOKEN" ]]; then
-    echo "ERROR: BOT_TOKEN is not set. Set it as an environment variable."
-    exit 1
-fi
-if [[ -z "$GROQ_API_KEY" ]]; then
-    echo "ERROR: GROQ_API_KEY is not set. Set it as an environment variable."
-    exit 1
-fi
-
 echo "========================================"
 echo "  SmartPal v3.0 — RUNNING"
 echo "  Owner : @Bazman"
 echo "  Time  : $(date '+%Y-%m-%d %H:%M:%S')"
 echo "  Limit : ${FREE_LIMIT} AI actions/day"
-echo "  BOT_DIR: ${BOT_DIR}"
 echo "========================================"
 log "SmartPal v3.0 started"
 
@@ -1645,352 +1160,23 @@ log "SmartPal v3.0 started"
 register_commands
 
 # ──────────────────────────────────────────────────────────────
-# IMAGE UNDERSTANDING
-# ──────────────────────────────────────────────────────────────
-handle_image() {
-    local cid="$1" file_id="$2" caption="$3"
-
-    [[ "$(can_ai "$cid")" == "no" ]] && limit_msg "$cid" && return
-
-    send_msg "$cid" "🔍 Looking at your image..."
-
-    # Get file path
-    local file_info file_path
-    file_info=$(curl -s "${TG_URL}/getFile?file_id=${file_id}" 2>/dev/null)
-    file_path=$(echo "$file_info" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('result',{}).get('file_path',''))" 2>/dev/null)
-
-    if [[ -z "$file_path" ]]; then
-        send_msg "$cid" "❌ Could not access the image. Please try again."
-        return
-    fi
-
-    # Download image
-    local img_tmp="$BOT_DIR/.img_${cid}.jpg"
-    curl -s "https://api.telegram.org/file/bot${BOT_TOKEN}/${file_path}" -o "$img_tmp" 2>/dev/null
-
-    # Convert to base64 for Groq vision
-    local img_b64
-    img_b64=$(python3 -c "import base64; print(base64.b64encode(open('${img_tmp}','rb').read()).decode())" 2>/dev/null)
-    rm -f "$img_tmp"
-
-    if [[ -z "$img_b64" ]]; then
-        send_msg "$cid" "❌ Could not process the image. Please try again."
-        return
-    fi
-
-    # Use the caption as the question if provided, else describe
-    local user_question="${caption:-Describe this image in detail. If it contains text, read it. If it contains a question or problem, answer it.}"
-
-    # Call Gemini Vision
-    local response
-    response=$(IMG_B64="$img_b64" USER_Q="$user_question" \
-               GEMINI_KEY="$GEMINI_API_KEY" python3 << 'PYEOF'
-import os, json, urllib.request, re
-b64      = os.environ["IMG_B64"]
-question = os.environ["USER_Q"]
-key      = os.environ["GEMINI_KEY"]
-
-payload = {
-    "contents": [{
-        "parts": [
-            {"inline_data": {"mime_type": "image/jpeg", "data": b64}},
-            {"text": question}
-        ]
-    }],
-    "generationConfig": {"maxOutputTokens": 1000}
-}
-
-url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={key}"
-req = urllib.request.Request(
-    url,
-    data=json.dumps(payload).encode(),
-    headers={"Content-Type": "application/json"}
-)
-try:
-    with urllib.request.urlopen(req, timeout=30) as r:
-        d = json.loads(r.read())
-        t = d["candidates"][0]["content"]["parts"][0]["text"]
-        t = re.sub(r"\*\*", "", t)
-        print(t.strip())
-except Exception as e:
-    print(f"ERROR:{e}")
-PYEOF
-    )
-
-    inc_usage "$cid"
-
-    if [[ "$response" == ERROR:* || -z "$response" ]]; then
-        send_msg "$cid" "❌ Could not analyse the image. Try again or send a clearer image."
-        return
-    fi
-
-    send_msg "$cid" "🖼️ *Image Analysis:*
-
-${response}"
-}
-
-# ──────────────────────────────────────────────────────────────
-# VOICE MESSAGE HANDLING
-# ──────────────────────────────────────────────────────────────
-handle_voice() {
-    local cid="$1" file_id="$2"
-
-    [[ "$(can_ai "$cid")" == "no" ]] && limit_msg "$cid" && return
-
-    send_msg "$cid" "🎤 Got your voice message! Transcribing..."
-
-    # Get file path
-    local file_info file_path
-    file_info=$(curl -s "${TG_URL}/getFile?file_id=${file_id}" 2>/dev/null)
-    file_path=$(echo "$file_info" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('result',{}).get('file_path',''))" 2>/dev/null)
-
-    if [[ -z "$file_path" ]]; then
-        send_msg "$cid" "❌ Could not access the voice message. Please try again."
-        return
-    fi
-
-    # Download voice file
-    local voice_tmp="$BOT_DIR/.voice_${cid}.ogg"
-    curl -s "https://api.telegram.org/file/bot${BOT_TOKEN}/${file_path}" -o "$voice_tmp" 2>/dev/null
-
-    # Transcribe using Groq Whisper
-    local transcript
-    transcript=$(VOICE_FILE="$voice_tmp" GROQ_KEY="$GROQ_API_KEY" python3 << 'PYEOF'
-import os, urllib.request
-voice_file = os.environ["VOICE_FILE"]
-key = os.environ["GROQ_KEY"]
-try:
-    with open(voice_file, "rb") as f:
-        audio_data = f.read()
-
-    import urllib.parse, json
-    boundary = "----FormBoundary7MA4YWxkTrZu0gW"
-    body = (
-        f"--{boundary}
-"
-        f"Content-Disposition: form-data; name="file"; filename="audio.ogg"
-"
-        f"Content-Type: audio/ogg
-
-"
-    ).encode() + audio_data + (
-        f"
---{boundary}
-"
-        f"Content-Disposition: form-data; name="model"
-
-"
-        f"whisper-large-v3-turbo
-"
-        f"--{boundary}--
-"
-    ).encode()
-
-    req = urllib.request.Request(
-        "https://api.groq.com/openai/v1/audio/transcriptions",
-        data=body,
-        headers={
-            "Authorization": f"Bearer {key}",
-            "Content-Type": f"multipart/form-data; boundary={boundary}"
-        }
-    )
-    with urllib.request.urlopen(req, timeout=30) as r:
-        d = json.loads(r.read())
-        print(d.get("text", ""))
-except Exception as e:
-    print(f"ERROR:{e}")
-PYEOF
-    )
-
-    rm -f "$voice_tmp"
-
-    if [[ "$transcript" == ERROR:* || -z "$transcript" ]]; then
-        send_msg "$cid" "❌ Could not transcribe. Please speak clearly and try again."
-        return
-    fi
-
-    send_msg "$cid" "🎤 *You said:* "${transcript}""
-
-    # Now process the transcribed text as a normal message
-    inc_usage "$cid"
-    handle "$cid" "$transcript"
-}
-
-# ──────────────────────────────────────────────────────────────
-# WEB SEARCH
-# ──────────────────────────────────────────────────────────────
-web_search_context() {
-    local query="$1"
-    # Use DuckDuckGo instant answers (free, no API key needed)
-    local result
-    result=$(SEARCH_Q="$query" python3 << 'PYEOF'
-import os, urllib.request, urllib.parse, json, re
-q = os.environ["SEARCH_Q"]
-encoded = urllib.parse.quote(q)
-url = f"https://api.duckduckgo.com/?q={encoded}&format=json&no_html=1&skip_disambig=1"
-try:
-    req = urllib.request.Request(url, headers={"User-Agent": "SmartPalBot/1.0"})
-    with urllib.request.urlopen(req, timeout=10) as r:
-        d = json.loads(r.read())
-        abstract = d.get("AbstractText", "")
-        answer = d.get("Answer", "")
-        related = [t.get("Text","") for t in d.get("RelatedTopics",[])[:3] if t.get("Text")]
-        result = ""
-        if answer: result += f"Quick answer: {answer}
-"
-        if abstract: result += f"{abstract}
-"
-        if related: result += "Related: " + " | ".join(related[:2])
-        print(result[:1500] if result.strip() else "NO_RESULTS")
-except:
-    print("NO_RESULTS")
-PYEOF
-    )
-    echo "$result"
-}
-
-needs_web_search() {
-    local text="${1,,}"
-    # Topics that likely need current/real-world info
-    [[ "$text" == *"today"*       ]] && echo "yes" && return
-    [[ "$text" == *"current"*     ]] && echo "yes" && return
-    [[ "$text" == *"latest"*      ]] && echo "yes" && return
-    [[ "$text" == *"news"*        ]] && echo "yes" && return
-    [[ "$text" == *"price of"*    ]] && echo "yes" && return
-    [[ "$text" == *"dollar"*      ]] && echo "yes" && return
-    [[ "$text" == *"exchange rate"* ]] && echo "yes" && return
-    [[ "$text" == *"who won"*      ]] && echo "yes" && return
-    [[ "$text" == *"what happened"* ]] && echo "yes" && return
-    [[ "$text" == *"naira"*       ]] && echo "yes" && return
-    echo "no"
-}
-
-# ──────────────────────────────────────────────────────────────
-# PERSISTENT MEMORY (save conversation across restarts)
-# ──────────────────────────────────────────────────────────────
-save_memory() {
-    local cid="$1" role="$2" text="$3"
-    local mem_file="$USERS_DIR/${cid}_memory.txt"
-    # Keep last 20 exchanges (40 lines)
-    echo "${role}|${text}" >> "$mem_file"
-    local line_count
-    line_count=$(wc -l < "$mem_file" 2>/dev/null || echo 0)
-    if [[ "$line_count" -gt 40 ]]; then
-        tail -40 "$mem_file" > "$mem_file.tmp" && mv "$mem_file.tmp" "$mem_file"
-    fi
-}
-
-load_memory() {
-    local cid="$1"
-    local mem_file="$USERS_DIR/${cid}_memory.txt"
-    [[ ! -f "$mem_file" ]] && echo "[]" && return
-    python3 << PYEOF
-import json
-msgs = []
-try:
-    with open("$mem_file") as f:
-        for line in f.read().strip().split("\n"):
-            if "|" in line:
-                role, text = line.split("|", 1)
-                if role in ("user", "assistant"):
-                    msgs.append({"role": role, "content": text})
-except: pass
-print(json.dumps(msgs[-20:]))
-PYEOF
-}
-
-clear_memory() {
-    local cid="$1"
-    rm -f "$USERS_DIR/${cid}_memory.txt"
-}
-
-# ──────────────────────────────────────────────────────────────
 # POLLING LOOP
 # ──────────────────────────────────────────────────────────────
 while true; do
     OFFSET=$(get_offset)
-    UPDATES=$(curl -s --max-time 30 "${TG_URL}/getUpdates?offset=${OFFSET}&timeout=10" 2>/dev/null || echo '{"ok":false,"result":[]}')
-    COUNT=$(echo "$UPDATES" | grep -o '"update_id"' | wc -l || echo "0")
+    UPDATES=$(curl -s "${TG_URL}/getUpdates?offset=${OFFSET}&timeout=10" 2>/dev/null || echo '{"ok":false,"result":[]}')
+    COUNT=$(echo "$UPDATES" | grep -o '"update_id"' | wc -l)
 
     if [[ "$COUNT" -gt 0 ]]; then
         for (( i=0; i<COUNT; i++ )); do
-            UPD_ID=$(parse_update "$UPDATES" "$i" "uid")
+            UID=$(parse_update "$UPDATES" "$i" "uid")
             CID=$(parse_update "$UPDATES" "$i" "cid")
             TXT=$(parse_update "$UPDATES" "$i" "text")
 
-            # Detect PDF, image, voice from this update
-            MEDIA_DATA=$(PU_JSON="$UPDATES" PU_IDX="$i" python3 << 'PYEOF'
-import os, json
-try:
-    d = json.loads(os.environ["PU_JSON"])
-    r = d.get("result", [])
-    idx = int(os.environ["PU_IDX"])
-    msg = r[idx].get("message", {})
-
-    # PDF
-    doc = msg.get("document", {})
-    if doc.get("mime_type") == "application/pdf":
-        print(f"PDF|{doc['file_id']}|{doc.get('file_name','document.pdf')}")
-
-    # Image (photo)
-    elif msg.get("photo"):
-        photos = msg["photo"]
-        best = max(photos, key=lambda p: p.get("file_size", 0))
-        caption = msg.get("caption", "")
-        print(f"IMAGE|{best['file_id']}|{caption}")
-
-    # Voice message
-    elif msg.get("voice"):
-        v = msg["voice"]
-        print(f"VOICE|{v['file_id']}|{v.get('duration',0)}")
-
-    # Audio file
-    elif msg.get("audio"):
-        a = msg["audio"]
-        print(f"VOICE|{a['file_id']}|{a.get('duration',0)}")
-
-    # Callback query (button tap)
-    elif r[idx].get("callback_query"):
-        cb = r[idx]["callback_query"]
-        print(f"CB|{cb.get('data','')}|")
-    else:
-        print("TEXT||")
-except Exception as e:
-    print("TEXT||")
-PYEOF
-            )
-
-            MEDIA_TYPE=$(echo "$MEDIA_DATA" | cut -d'|' -f1)
-            MEDIA_ID=$(echo "$MEDIA_DATA"   | cut -d'|' -f2)
-            MEDIA_EXTRA=$(echo "$MEDIA_DATA" | cut -d'|' -f3-)
-
-            # Callback button tap — treat as text
-            if [[ "$MEDIA_TYPE" == "CB" && -n "$MEDIA_ID" ]]; then
-                TXT="$MEDIA_ID"
-            fi
-
-            if [[ -n "$UPD_ID" && -n "$CID" ]]; then
-                case "$MEDIA_TYPE" in
-                    PDF)
-                        echo "[$(date '+%H:%M:%S')] Chat ${CID}: [PDF] ${MEDIA_EXTRA}"
-                        handle_pdf "$CID" "$MEDIA_ID" "$MEDIA_EXTRA"
-                        ;;
-                    IMAGE)
-                        echo "[$(date '+%H:%M:%S')] Chat ${CID}: [IMAGE]"
-                        handle_image "$CID" "$MEDIA_ID" "$MEDIA_EXTRA"
-                        ;;
-                    VOICE)
-                        echo "[$(date '+%H:%M:%S')] Chat ${CID}: [VOICE]"
-                        handle_voice "$CID" "$MEDIA_ID"
-                        ;;
-                    *)
-                        if [[ -n "$TXT" ]]; then
-                            echo "[$(date '+%H:%M:%S')] Chat ${CID}: ${TXT}"
-                            handle "$CID" "$TXT"
-                        fi
-                        ;;
-                esac
-                save_offset $(( UPD_ID + 1 ))
+            if [[ -n "$UID" && -n "$CID" && -n "$TXT" ]]; then
+                echo "[$(date '+%H:%M:%S')] Chat ${CID}: ${TXT}"
+                handle "$CID" "$TXT"
+                save_offset $(( UID + 1 ))
             fi
         done
     fi
